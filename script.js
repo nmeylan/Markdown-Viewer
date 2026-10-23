@@ -829,6 +829,9 @@ document.addEventListener("DOMContentLoaded", async function () {
     if (isReleaseNotesActive()) {
       return 'Release notes are read only.';
     }
+    if (isDiskDocument(getActiveOpenDocument())) {
+      return 'Files from disk are read only.';
+    }
     if (isLiveViewOnlyParticipant()) {
       return 'This Live Share session is view only.';
     }
@@ -1727,7 +1730,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     const folders = organization && Array.isArray(organization.folders) ? organization.folders : [];
     const byId = new Map(folders.map(function(folder) { return [folder.id, folder]; }));
     folders.forEach(function(folder) {
-      if (!folder || folder.workspaceId === 'workspace_secret') return;
+      if (!folder || folder.workspaceId === 'workspace_secret' || folder.workspaceId === DISK_WORKSPACE_ID) return;
       const names = [];
       const visited = new Set();
       let current = folder;
@@ -4246,6 +4249,10 @@ document.addEventListener("DOMContentLoaded", async function () {
   const SECRET_KDF_ITERATIONS = 250000;
   const DEFAULT_WORKSPACE_ID = 'workspace_default';
   const SECRET_WORKSPACE_ID = 'workspace_secret';
+  const DISK_WORKSPACE_ID = 'workspace_disk';
+  const DISK_WORKSPACE_STATE_KEY = 'diskWorkspaceState';
+  const DISK_WORKSPACE_MAX_FILES = 2000;
+  const DISK_DOCUMENT_STATE_FIELDS = ['isOpen', 'scrollPos', 'previewScrollPos', 'previewScrollLeft', 'viewMode', 'lastOpenedAt', 'favorite'];
   const SIDEBAR_MIN_WIDTH = 220;
   const SIDEBAR_MAX_WIDTH = 420;
   let tabs = [];
@@ -4294,6 +4301,12 @@ document.addEventListener("DOMContentLoaded", async function () {
   let pendingWorkspacePersistIds = new Set();
   let suspendWorkspacePersistence = false;
   let secretWorkspaceEnvelopeCache = null;
+  let diskWorkspaceAvailable = false;
+  let diskWorkspaceState = null;
+  let diskWorkspaceStateJson = '';
+  let diskWorkspaceTreeKey = null;
+  let diskWorkspaceSyncing = false;
+  let diskWorkspaceTruncationShown = false;
   const LIVE_EDIT_ORIGIN = Symbol("markdown-viewer-live-local-edit");
   const LIVE_RELAY_ORIGIN = Symbol("markdown-viewer-live-relay");
   const LIVE_REVIEW_EDIT_ORIGIN = Symbol("markdown-viewer-live-review-local-edit");
@@ -4307,22 +4320,26 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function createDefaultDocumentOrganization() {
+    const workspaces = [
+      {
+        id: DEFAULT_WORKSPACE_ID,
+        name: 'Workspace',
+        expanded: true,
+        createdAt: 0
+      },
+      {
+        id: SECRET_WORKSPACE_ID,
+        name: 'Secret Workspace',
+        expanded: false,
+        createdAt: 1
+      }
+    ];
+    if (diskWorkspaceAvailable) {
+      workspaces.push({ id: DISK_WORKSPACE_ID, name: 'Disk', expanded: true, createdAt: 2 });
+    }
     return {
       version: DOCUMENT_ORGANIZATION_VERSION,
-      workspaces: [
-        {
-          id: DEFAULT_WORKSPACE_ID,
-          name: 'Workspace',
-          expanded: true,
-          createdAt: 0
-        },
-        {
-          id: SECRET_WORKSPACE_ID,
-          name: 'Secret Workspace',
-          expanded: false,
-          createdAt: 1
-        }
-      ],
+      workspaces: workspaces,
       folders: [],
       ui: {
         filter: 'all',
@@ -4338,10 +4355,8 @@ document.addEventListener("DOMContentLoaded", async function () {
     const fallback = createDefaultDocumentOrganization();
     const source = raw && typeof raw === 'object' ? raw : {};
     const rawWorkspaces = Array.isArray(source.workspaces) ? source.workspaces : [];
-    const storedDefault = rawWorkspaces.find(function(workspace) { return workspace && workspace.id === DEFAULT_WORKSPACE_ID; });
-    const storedSecret = rawWorkspaces.find(function(workspace) { return workspace && workspace.id === SECRET_WORKSPACE_ID; });
     const workspaces = fallback.workspaces.map(function(workspace) {
-      const stored = workspace.id === DEFAULT_WORKSPACE_ID ? storedDefault : storedSecret;
+      const stored = rawWorkspaces.find(function(item) { return item && item.id === workspace.id; });
       return Object.assign({}, workspace, {
         expanded: stored ? stored.expanded !== false : workspace.expanded
       });
@@ -4353,7 +4368,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       const id = String(folder.id || '').slice(0, 120);
       const sourceWorkspaceId = String(folder.workspaceId || '');
       const workspaceId = sourceWorkspaceId === SECRET_WORKSPACE_ID ? SECRET_WORKSPACE_ID : DEFAULT_WORKSPACE_ID;
-      if (!id || seenFolderIds.has(id) || workspaceId === SECRET_WORKSPACE_ID) return null;
+      if (!id || seenFolderIds.has(id) || workspaceId === SECRET_WORKSPACE_ID || sourceWorkspaceId === DISK_WORKSPACE_ID) return null;
       seenFolderIds.add(id);
       return {
         id: id,
@@ -4450,7 +4465,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         };
       }),
       folders: documentOrganization.folders.filter(function(folder) {
-        return folder.workspaceId !== SECRET_WORKSPACE_ID;
+        return folder.workspaceId !== SECRET_WORKSPACE_ID && folder.workspaceId !== DISK_WORKSPACE_ID;
       }),
       ui: Object.assign({}, documentOrganization.ui, {
         lastWorkspaceId: documentOrganization.ui.lastWorkspaceId === SECRET_WORKSPACE_ID && !secretWorkspaceKey
@@ -4473,7 +4488,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         saveStorageItem(DOCUMENT_ORGANIZATION_KEY, JSON.stringify(documentOrganizationPersistedSnapshot));
         if (result && result.merged && sequence === organizationSaveSequence) {
           const secretFolders = documentOrganization.folders.filter(function(folder) {
-            return folder.workspaceId === SECRET_WORKSPACE_ID;
+            return folder.workspaceId === SECRET_WORKSPACE_ID || folder.workspaceId === DISK_WORKSPACE_ID;
           });
           const normalized = normalizeDocumentOrganization(result.organization);
           normalized.folders = normalized.folders.concat(secretFolders);
@@ -4491,6 +4506,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       saveStorageItem(DOCUMENT_ORGANIZATION_KEY, JSON.stringify(storageOrganization));
     }
     scheduleSecretWorkspaceSave();
+    saveDiskWorkspaceState();
   }
 
   function getSecretWorkspaceEnvelope() {
@@ -5170,7 +5186,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function getDocumentCountForLimit() {
-    return tabs.filter(function(tab) { return !isReleaseNotesTab(tab); }).length +
+    return tabs.filter(function(tab) { return !isReleaseNotesTab(tab) && !isDiskDocument(tab); }).length +
       (isSecretWorkspaceUnlocked() ? 0 : secretWorkspaceDocumentCount);
   }
 
@@ -5267,6 +5283,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       delete tab.folderId;
       return tab;
     }
+    if (isDiskDocument(tab)) return tab;
 
     const requestedWorkspaceId = tab.workspaceId === SECRET_WORKSPACE_ID && settings.allowSecret === true
       ? SECRET_WORKSPACE_ID
@@ -5326,7 +5343,8 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function getPreferredDocumentLocation() {
-    const requestedWorkspaceId = documentOrganization.ui.lastWorkspaceId === SECRET_WORKSPACE_ID && !isSecretWorkspaceUnlocked()
+    const requestedWorkspaceId = (documentOrganization.ui.lastWorkspaceId === SECRET_WORKSPACE_ID && !isSecretWorkspaceUnlocked()) ||
+      documentOrganization.ui.lastWorkspaceId === DISK_WORKSPACE_ID
       ? DEFAULT_WORKSPACE_ID
       : documentOrganization.ui.lastWorkspaceId;
     const workspaceId = getWorkspaceById(requestedWorkspaceId)
@@ -5562,6 +5580,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     if (documents.length > 1) title.textContent = 'Move ' + documents.length + ' selected files';
     select.textContent = '';
     documentOrganization.workspaces.forEach(function(workspace) {
+      if (workspace.id === DISK_WORKSPACE_ID) return;
       const rootOption = document.createElement('option');
       rootOption.value = workspace.id + '|';
       const locked = workspace.id === SECRET_WORKSPACE_ID && !isSecretWorkspaceUnlocked();
@@ -5885,6 +5904,19 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function getDocumentMenuActions(tab) {
+    if (isDiskDocument(tab)) {
+      return [
+        { id: 'open', icon: 'lucide-file-text', label: 'Open', run: function() { openSidebarDocument(tab.id); } },
+        { id: 'copy-to-workspace', icon: 'lucide-copy', label: 'Copy to Workspace', run: function() { copyDiskDocumentToWorkspace(tab.id); } },
+        {
+          id: 'favorite',
+          icon: tab.favorite ? 'lucide-star-filled' : 'lucide-star',
+          label: tab.favorite ? 'Remove from Favorites' : 'Add to Favorites',
+          run: function() { toggleDocumentFavorite(tab.id); }
+        },
+        getDiskRefreshAction()
+      ];
+    }
     const actions = [
       { id: 'open', icon: 'lucide-file-text', label: 'Open', run: function() { openSidebarDocument(tab.id); } }, {
       id: 'rename', icon: 'lucide-square-pen', label: 'Rename', run: function() { renameTab(tab.id); }
@@ -5933,6 +5965,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         run: function() { openSecretWorkspaceDialog(); }
       }];
     }
+    if (workspace.id === DISK_WORKSPACE_ID) return [getDiskRefreshAction()];
     const actions = [
       { id: 'new-document', icon: 'lucide-file-text', label: 'New file', run: function() { newTab('', null, { workspaceId: workspace.id }); } },
       { id: 'new-folder', icon: 'lucide-folder-plus', label: 'New folder', run: function() { createFolder(workspace.id); } }
@@ -5944,6 +5977,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function getFolderMenuActions(folder) {
+    if (folder.workspaceId === DISK_WORKSPACE_ID) return [getDiskRefreshAction()];
     return [
       { id: 'new-document', icon: 'lucide-file-text', label: 'New file', run: function() { newTab('', null, { workspaceId: folder.workspaceId, folderId: folder.id }); } },
       { id: 'new-folder', icon: 'lucide-folder-plus', label: 'New folder', run: function() { createFolder(folder.workspaceId, folder.id); } },
@@ -5979,11 +6013,11 @@ document.addEventListener("DOMContentLoaded", async function () {
       const type = key.slice(0, separator);
       const id = key.slice(separator + 1);
       if (type === 'document') {
-        const tab = tabs.find(function(item) { return item.id === id && !isTemporaryDocument(item); });
+        const tab = tabs.find(function(item) { return item.id === id && !isTemporaryDocument(item) && !isDiskDocument(item); });
         if (tab) entities.push({ type: type, id: id, item: tab });
       } else if (type === 'folder') {
         const folder = getFolderById(id);
-        if (folder) entities.push({ type: type, id: id, item: folder });
+        if (folder && folder.workspaceId !== DISK_WORKSPACE_ID) entities.push({ type: type, id: id, item: folder });
       }
     });
     return entities;
@@ -6414,7 +6448,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   async function moveDocumentToLocation(tabId, workspaceId, folderId, options) {
     const shouldAnnounce = !options || options.announce !== false;
     const tab = tabs.find(function(item) { return item.id === tabId; });
-    if (!tab || isTemporaryDocument(tab)) return false;
+    if (!tab || isTemporaryDocument(tab) || isDiskDocument(tab) || workspaceId === DISK_WORKSPACE_ID) return false;
     if (workspaceId === SECRET_WORKSPACE_ID && !isSecretWorkspaceUnlocked()) {
       withUnlockedSecretWorkspace(function() {
         moveDocumentToLocation(tabId, workspaceId, folderId, options);
@@ -6628,7 +6662,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function attachDocumentDropTarget(target, location) {
-    if (!target || !location) return;
+    if (!target || !location || location.workspaceId === DISK_WORKSPACE_ID) return;
     target.setAttribute('data-drop-workspace-id', location.workspaceId);
     if (location.folderId) target.setAttribute('data-drop-folder-id', location.folderId);
 
@@ -6778,7 +6812,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       if (event.target.closest('input, select, textarea, a')) return;
       openDocumentTreeContextMenu(row, event);
     });
-    if (options.documentId && !options.temporary) {
+    if (options.documentId && !options.temporary && !options.readOnly) {
       row.draggable = true;
       row.addEventListener('dragstart', function(event) {
         const rowSelectionKey = getDocumentTreeSelectionKey('document', options.documentId);
@@ -6830,6 +6864,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       depth: depth,
       favorite: tab.favorite === true,
       temporary: isTemporaryDocument(tab),
+      readOnly: isDiskDocument(tab),
       meta: meta || '',
       menuActions: getDocumentMenuActions(tab),
       onActivate: function() {
@@ -6934,7 +6969,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         ariaLabel: workspace.name + (secretLocked ? ', locked' : ', file location'),
         icon: isSecretWorkspace
           ? (secretLocked ? 'lucide-shield' : 'lucide-shield-check')
-          : 'lucide-briefcase-business',
+          : (workspace.id === DISK_WORKSPACE_ID ? 'lucide-database' : 'lucide-briefcase-business'),
         depth: 0,
         expanded: expanded,
         meta: secretLocked ? 'Locked' : String(workspaceDocuments.length),
@@ -10611,7 +10646,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   }
 
   function writeDirtyDocumentJournal(tab, content) {
-    if (!tab || isTemporaryDocument(tab) || isPrivateStorageMode()) return true;
+    if (!tab || isTemporaryDocument(tab) || isDiskDocument(tab) || isPrivateStorageMode()) return true;
     if (tab.workspaceId === SECRET_WORKSPACE_ID) {
       writeSecretDirtyDocumentJournal(tab, content);
       return true;
@@ -11084,7 +11119,7 @@ document.addEventListener("DOMContentLoaded", async function () {
 
   function getTabsForStorage(tabsArr) {
     const sourceTabs = stripTemporaryTabs(tabsArr || tabs).filter(function(tab) {
-      return tab.workspaceId !== SECRET_WORKSPACE_ID;
+      return tab.workspaceId !== SECRET_WORKSPACE_ID && !isDiskDocument(tab);
     });
     if (!liveCollaboration) {
       return sourceTabs;
@@ -11127,6 +11162,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       updateSaveStatus('saved');
       return true;
     }
+    saveDiskWorkspaceState();
     try {
       const storageTabs = getTabsForStorage(tabsArr);
       if (workspaceStorage) {
@@ -11262,6 +11298,7 @@ document.addEventListener("DOMContentLoaded", async function () {
   async function ensureTabContent(tab) {
     if (!tab) return '';
     if (tab.contentLoaded !== false && typeof tab.content === 'string') return tab.content;
+    if (isDiskDocument(tab)) return loadDiskDocumentContent(tab);
     if (!workspaceStorage || isTemporaryDocument(tab) || tab.workspaceId === SECRET_WORKSPACE_ID) {
       tab.content = typeof tab.content === 'string' ? tab.content : '';
       tab.contentLoaded = true;
@@ -11311,6 +11348,240 @@ document.addEventListener("DOMContentLoaded", async function () {
       delete tab._persistedContent;
       loadedCount -= 1;
     }
+  }
+
+  // Disk workspace: a read-only tree of the Markdown files served under /files/.
+  function isDiskDocument(tab) {
+    return Boolean(tab && tab.workspaceId === DISK_WORKSPACE_ID);
+  }
+
+  function hashDiskPath(path) {
+    // cyrb53 (64-bit variant): synchronous and, unlike crypto.subtle, available without a secure context.
+    let h1 = 0xdeadbeef;
+    let h2 = 0x41c6ce57;
+    for (let index = 0; index < path.length; index++) {
+      const code = path.charCodeAt(index);
+      h1 = Math.imul(h1 ^ code, 2654435761);
+      h2 = Math.imul(h2 ^ code, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+  }
+
+  async function probeDiskWorkspace() {
+    try {
+      const response = await fetch('/files/', { cache: 'no-store' });
+      return response.ok && Array.isArray(await response.json());
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function initDiskWorkspace() {
+    let stored = null;
+    try {
+      if (workspaceStorage) stored = await workspaceStorage.getMetadata(DISK_WORKSPACE_STATE_KEY);
+    } catch (error) {
+      console.warn('Failed to read the Disk workspace state:', error);
+    }
+    diskWorkspaceState = Object.assign({ documents: {}, folders: {} }, stored);
+    diskWorkspaceStateJson = JSON.stringify(diskWorkspaceState);
+    await syncDiskWorkspace();
+    window.addEventListener('focus', syncDiskWorkspace);
+    setInterval(function() {
+      if (document.visibilityState === 'visible') syncDiskWorkspace();
+    }, 5000);
+  }
+
+  function saveDiskWorkspaceState() {
+    if (!diskWorkspaceState || diskWorkspaceTreeKey === null || !workspaceStorage || isPrivateStorageMode()) return;
+    const state = { documents: {}, folders: {} };
+    tabs.forEach(function(tab) {
+      if (!isDiskDocument(tab) || (!tab.lastOpenedAt && !tab.favorite)) return;
+      state.documents[tab.id] = {};
+      DISK_DOCUMENT_STATE_FIELDS.forEach(function(field) { state.documents[tab.id][field] = tab[field]; });
+    });
+    documentOrganization.folders.forEach(function(folder) {
+      if (folder.workspaceId === DISK_WORKSPACE_ID && folder.expanded) state.folders[folder.id] = true;
+    });
+    const json = JSON.stringify(state);
+    if (json === diskWorkspaceStateJson) return;
+    diskWorkspaceState = state;
+    diskWorkspaceStateJson = json;
+    workspaceStorage.setMetadata(DISK_WORKSPACE_STATE_KEY, state).catch(function(error) {
+      console.warn('Failed to save the Disk workspace state:', error);
+    });
+  }
+
+  async function crawlDiskWorkspace() {
+    const listing = { folders: [], files: [], truncated: false };
+    async function walk(directory) {
+      const response = await fetch(getLinkedFileUrl(directory), { cache: 'no-store' });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const entries = await response.json();
+      for (const entry of entries) {
+        if (listing.truncated) return;
+        if (!entry || typeof entry.name !== 'string' || entry.name.charAt(0) === '.') continue;
+        const path = directory + entry.name;
+        if (entry.type === 'directory') {
+          listing.folders.push(path);
+          await walk(path + '/');
+        } else if (entry.type === 'file' && /\.(md|markdown)$/i.test(entry.name)) {
+          if (listing.files.length >= DISK_WORKSPACE_MAX_FILES) listing.truncated = true;
+          else listing.files.push({ path: path, mtime: Date.parse(entry.mtime) || 0, size: Number(entry.size) || 0 });
+        }
+      }
+    }
+    await walk('');
+    return listing;
+  }
+
+  async function syncDiskWorkspace() {
+    if (diskWorkspaceSyncing || !documentOrganization || !diskWorkspaceState) return;
+    diskWorkspaceSyncing = true;
+    try {
+      let listing;
+      try {
+        listing = await crawlDiskWorkspace();
+      } catch (error) {
+        console.warn('Failed to list the Disk workspace:', error);
+        return;
+      }
+      if (listing.truncated && !diskWorkspaceTruncationShown) {
+        diskWorkspaceTruncationShown = true;
+        showAppToast('Only the first ' + DISK_WORKSPACE_MAX_FILES + ' Markdown files from disk are shown.', {
+          tone: 'warning',
+          title: 'Disk workspace truncated'
+        });
+      }
+      const getFolderId = function(path) { return path ? 'diskfolder_' + hashDiskPath(path) : null; };
+      const getParentPath = function(path) { return path.slice(0, Math.max(0, path.lastIndexOf('/'))); };
+      const existingFolders = new Map(documentOrganization.folders.filter(function(folder) {
+        return folder.workspaceId === DISK_WORKSPACE_ID;
+      }).map(function(folder) { return [folder.id, folder]; }));
+      const folders = listing.folders.filter(function(path) {
+        return listing.files.some(function(file) { return file.path.indexOf(path + '/') === 0; });
+      }).map(function(path) {
+        const id = getFolderId(path);
+        return existingFolders.get(id) || {
+          id: id,
+          workspaceId: DISK_WORKSPACE_ID,
+          parentFolderId: getFolderId(getParentPath(path)),
+          name: path.split('/').pop(),
+          expanded: diskWorkspaceState.folders[id] === true,
+          createdAt: 0
+        };
+      });
+
+      const existingDocuments = new Map(tabs.filter(isDiskDocument).map(function(tab) { return [tab.id, tab]; }));
+      const documentIds = new Set();
+      const added = [];
+      const changed = [];
+      listing.files.forEach(function(file) {
+        const id = 'disk_' + hashDiskPath(file.path);
+        const existing = existingDocuments.get(id);
+        documentIds.add(id);
+        if (existing) {
+          if (existing.diskMtime !== file.mtime || existing.diskSize !== file.size) changed.push(existing);
+          existing.diskMtime = file.mtime;
+          existing.diskSize = file.size;
+          return;
+        }
+        const stored = diskWorkspaceState.documents[id] || {};
+        const tab = {
+          id: id,
+          title: getMarkdownFileTitle({ name: file.path.split('/').pop() }),
+          content: undefined,
+          contentLoaded: false,
+          scrollPos: 0,
+          previewScrollPos: 0,
+          previewScrollLeft: 0,
+          viewMode: 'split',
+          reviewThreads: [],
+          favorite: false,
+          isOpen: false,
+          lastOpenedAt: 0,
+          lastEditedAt: file.mtime,
+          createdAt: file.mtime,
+          workspaceId: DISK_WORKSPACE_ID,
+          folderId: getFolderId(getParentPath(file.path)),
+          sourcePath: file.path,
+          diskMtime: file.mtime,
+          diskSize: file.size
+        };
+        DISK_DOCUMENT_STATE_FIELDS.forEach(function(field) {
+          if (stored[field] !== undefined) tab[field] = stored[field];
+        });
+        added.push(tab);
+      });
+
+      const removed = tabs.filter(function(tab) { return isDiskDocument(tab) && !documentIds.has(tab.id); });
+      const closed = removed.filter(isTabOpen);
+      closed.sort(function(left, right) {
+        return (left.id === activeTabId) - (right.id === activeTabId);
+      }).forEach(function(tab) { closeTab(tab.id); });
+      removed.forEach(function(tab) { delete tabHistories[tab.id]; });
+      tabs = tabs.filter(function(tab) { return !removed.includes(tab); }).concat(added);
+      documentOrganization.folders = documentOrganization.folders.filter(function(folder) {
+        return folder.workspaceId !== DISK_WORKSPACE_ID;
+      }).concat(folders);
+      if (closed.length) {
+        showAppToast(closed.map(function(tab) { return '“' + (tab.title || 'Untitled') + '”'; }).join(', ') +
+          (closed.length === 1 ? ' was' : ' were') + ' removed from disk and closed.', {
+          tone: 'warning',
+          title: 'File removed from disk'
+        });
+      }
+
+      const treeKey = folders.map(function(folder) { return folder.id; }).concat(Array.from(documentIds)).join('|');
+      if (treeKey !== diskWorkspaceTreeKey) {
+        diskWorkspaceTreeKey = treeKey;
+        renderDocumentSidebar();
+      }
+      // The active document is already polled by checkLinkedDocument.
+      changed.forEach(function(tab) {
+        if (tab.id !== activeTabId && tab.contentLoaded !== false) checkLinkedDocument(tab);
+      });
+    } finally {
+      diskWorkspaceSyncing = false;
+    }
+  }
+
+  async function loadDiskDocumentContent(tab) {
+    try {
+      const response = await fetch(getLinkedFileUrl(tab.sourcePath), { cache: 'no-store' });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const file = await readLinkedFileResponse(response);
+      tab.content = file.text;
+      tab.sourceEtag = file.etag;
+    } catch (error) {
+      console.warn('Failed to read the file from disk:', error);
+      showAppToast('“' + (tab.title || 'Untitled') + '” could not be read from disk.', {
+        tone: 'error',
+        title: 'Document unavailable'
+      });
+      tab.content = '';
+      tab.sourceEtag = '';
+    }
+    tab.contentLoaded = true;
+    tab._persistedContent = tab.content;
+    tab.sourceSyncedAt = Date.now();
+    return tab.content;
+  }
+
+  function getDiskRefreshAction() {
+    return { id: 'refresh', icon: 'lucide-refresh-cw', label: 'Refresh', run: function() { syncDiskWorkspace(); } };
+  }
+
+  async function copyDiskDocumentToWorkspace(tabId) {
+    const source = tabs.find(function(item) { return item.id === tabId; });
+    if (!source) return;
+    const content = await ensureTabContent(source);
+    const tab = createImportedDocument(content, source.title, { workspaceId: DEFAULT_WORKSPACE_ID, folderId: null });
+    if (!tab) return;
+    await persistImportedDocuments([tab.id]);
+    openSidebarDocument(tab.id);
   }
 
   function getActiveOpenDocument() {
@@ -11497,7 +11768,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     dropdown.className = 'tab-menu-dropdown';
     dropdown.setAttribute('data-tab-menu-dropdown', 'true');
     dropdown.setAttribute('role', 'menu');
-    const duplicateAction = isShareSnapshotTab(tab)
+    const duplicateAction = isShareSnapshotTab(tab) || isDiskDocument(tab)
       ? ''
       : '<button type="button" class="tab-menu-item" role="menuitem" data-action="duplicate"><i class="lucide lucide-files"></i> Duplicate</button>';
     const downloadAction = isShareSnapshotTab(tab)
@@ -11512,11 +11783,14 @@ document.addEventListener("DOMContentLoaded", async function () {
       : tabs.length > 1
       ? '<button type="button" class="tab-menu-item" role="menuitem" data-action="split"><i class="lucide lucide-columns-2"></i> Open in split view</button>'
       : '';
-    const stopWatchingAction = tab.sourcePath
+    const stopWatchingAction = tab.sourcePath && !isDiskDocument(tab)
       ? '<button type="button" class="tab-menu-item" role="menuitem" data-action="stop-watching"><i class="lucide lucide-eye-off"></i> Stop watching file</button>'
       : '';
+    const renameAction = isDiskDocument(tab)
+      ? ''
+      : '<button type="button" class="tab-menu-item" role="menuitem" data-action="rename"><i class="lucide lucide-square-pen"></i> Rename</button>';
     dropdown.innerHTML =
-      '<button type="button" class="tab-menu-item" role="menuitem" data-action="rename"><i class="lucide lucide-square-pen"></i> Rename</button>' +
+      renameAction +
       duplicateAction +
       favoriteAction +
       splitAction +
@@ -11684,7 +11958,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       icon: isCombinedSplitTab ? 'lucide-panel-right-close' : 'lucide-columns-2',
       label: isCombinedSplitTab ? 'Exit split view' : 'Open in split view',
       disabled: !isCombinedSplitTab && tabs.length < 2
-    }].concat(tab.sourcePath ? [{
+    }].concat(tab.sourcePath && !isDiskDocument(tab) ? [{
       id: 'stop-watching', icon: 'lucide-eye-off', label: 'Stop watching file'
     }] : [], [{
       separator: true
@@ -12266,7 +12540,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     documentSplitEditor.hidden = previewMode;
     documentSplitPreview.hidden = !previewMode;
     if (documentSplitEditor.value !== tab.content) documentSplitEditor.value = tab.content || '';
-    documentSplitEditor.readOnly = shareSnapshotViewOnlyTabIds.has(tab.id) || isReleaseNotesTab(tab);
+    documentSplitEditor.readOnly = shareSnapshotViewOnlyTabIds.has(tab.id) || isReleaseNotesTab(tab) || isDiskDocument(tab);
     documentSplitEditor.setAttribute('aria-label', 'Edit ' + (tab.title || 'Untitled') + ' in split view');
     documentSplitPreview.setAttribute('aria-label', 'Preview ' + (tab.title || 'Untitled') + ' in split view');
     if (previewMode) renderDocumentSplitPreview(tab);
@@ -12543,6 +12817,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     const idx = tabs.findIndex(function(t) { return t.id === tabId; });
     if (idx === -1) return;
     const tab = tabs[idx];
+    if (isDiskDocument(tab)) return false;
     const wasActive = activeTabId === tabId;
     const splitPartnerId = wasActive ? secondarySplitTabId : null;
     if (wasActive) saveCurrentTabState();
@@ -12930,6 +13205,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         }
       }
       untitledCounter = loadUntitledCounter();
+      diskWorkspaceAvailable = await probeDiskWorkspace();
       documentOrganization = await loadDocumentOrganization();
       initializeSecretWorkspaceState();
       tabs = await loadTabsFromStorage();
@@ -12940,6 +13216,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     document.documentElement.dataset.workspaceStorageState = 'ready';
     const recoveredIds = await recoverDirtyDocumentJournals();
     const hadExistingWorkspace = tabs.length > 0;
+    if (diskWorkspaceAvailable) await initDiskWorkspace();
     activeTabId = loadActiveTabId();
 
     // Check if Neutralino passed an initial file via command line (early load)
@@ -12951,7 +13228,7 @@ document.addEventListener("DOMContentLoaded", async function () {
       saveTabsToStorage(tabs);
       saveActiveTabId(activeTabId);
       delete window.NL_INITIAL_FILE_CONTENT;
-    } else if (tabs.length === 0) {
+    } else if (!hadExistingWorkspace) {
       const tab = createTab(sampleMarkdown, 'Welcome to Markdown');
       tabs.push(tab);
       activeTabId = tab.id;
@@ -15462,7 +15739,7 @@ ${selector} .arrowheadPath {
   }
 
   function isLinkedTabDirty(tab) {
-    return Number(tab.lastEditedAt) > Number(tab.sourceSyncedAt);
+    return !isDiskDocument(tab) && Number(tab.lastEditedAt) > Number(tab.sourceSyncedAt);
   }
 
   function applyLinkedFileContent(tab, text, etag) {
@@ -15501,7 +15778,7 @@ ${selector} .arrowheadPath {
         headers: etag ? { 'If-None-Match': etag } : {}
       });
       if (response.status === 404) {
-        if (!linkedFileMissingIds.has(tab.id)) {
+        if (!linkedFileMissingIds.has(tab.id) && !isDiskDocument(tab)) {
           linkedFileMissingIds.add(tab.id);
           showAppToast('“' + (tab.title || 'Untitled') + '” is no longer at ' + tab.sourcePath + '. The document was kept.', {
             tone: 'warning',
@@ -15554,7 +15831,7 @@ ${selector} .arrowheadPath {
 
   async function openLinkedFile(path) {
     const existing = tabs.find(function(tab) {
-      return tab.sourcePath === path && tab.workspaceId !== SECRET_WORKSPACE_ID;
+      return tab.sourcePath === path && tab.workspaceId !== SECRET_WORKSPACE_ID && !isDiskDocument(tab);
     });
     if (existing) {
       await switchTab(existing.id);
@@ -28302,7 +28579,7 @@ ${selector} .arrowheadPath {
   }
 
   function canMutateEditor() {
-    return hasActiveOpenDocument() && !reviewModeActive && !isLiveViewOnlyParticipant() && !isShareSnapshotViewOnlyActive() && !isReleaseNotesActive();
+    return hasActiveOpenDocument() && !reviewModeActive && !isLiveViewOnlyParticipant() && !isShareSnapshotViewOnlyActive() && !isReleaseNotesActive() && !isDiskDocument(getActiveOpenDocument());
   }
 
   function isLiveMutatingAction(action) {
@@ -28438,7 +28715,7 @@ ${selector} .arrowheadPath {
     const snapshotActive = isShareSnapshotActive();
     const liveShareDocumentActive = isLiveShareDocumentActive();
     const liveShareGuestDocumentActive = liveShareDocumentActive && !isLiveShareHostDocumentActive();
-    const viewOnly = isLiveViewOnlyParticipant() || snapshotViewOnly || releaseNotesActive;
+    const viewOnly = isLiveViewOnlyParticipant() || snapshotViewOnly || releaseNotesActive || isDiskDocument(getActiveOpenDocument());
     document.body.classList.toggle('release-notes-active', releaseNotesActive);
     if (!releaseNotesActive) updateReleaseNotesActionAvailability(false);
     const sourceReadOnly = viewOnly || reviewModeActive;
