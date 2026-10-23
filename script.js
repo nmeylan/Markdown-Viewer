@@ -25018,10 +25018,10 @@ ${selector} .arrowheadPath {
   });
   previewPane.addEventListener("scroll", function() {
     const renderedDocumentId = previewLastRenderedTabId;
-    if (renderedDocumentId) {
-      savePreviewScrollSnapshot(renderedDocumentId, capturePreviewScroll());
-    }
-    if (renderedDocumentId !== activeTabId) return;
+    // A large document renders deferred behind a skeleton: until it commits, the pane
+    // scroll must not overwrite the snapshot of the previously rendered tab.
+    if (!renderedDocumentId || renderedDocumentId !== activeTabId) return;
+    savePreviewScrollSnapshot(renderedDocumentId, capturePreviewScroll());
     if (secondarySplitTabId && currentViewMode === 'preview') {
       syncDocumentSplitScroll(previewPane, documentSplitPreview);
     } else {

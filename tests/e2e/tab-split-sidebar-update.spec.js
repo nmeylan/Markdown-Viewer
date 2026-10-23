@@ -229,6 +229,19 @@ test('Preview scroll positions stay isolated per document with sync disabled', a
   await expectPreviewScroll(page, positionB);
 });
 
+test('switching to a large Preview document keeps the previous document position', async ({ page }) => {
+  const [documentA, documentB] = await createPreviewDocuments(page, [
+    { label: 'Small Preview document', sections: 40 },
+    { label: 'Large Preview document', sections: 200 }
+  ]);
+
+  await switchToPreviewDocument(page, documentA, 'Small Preview document');
+  const positionA = await setPreviewScrollRatio(page, 0.6);
+  await switchToPreviewDocument(page, documentB, 'Large Preview document');
+  await switchToPreviewDocument(page, documentA, 'Small Preview document');
+  await expectPreviewScroll(page, positionA);
+});
+
 test('three Preview documents retain positions after tab reordering and repeated switching', async ({ page }) => {
   const labels = ['Preview sequence A', 'Preview sequence B', 'Preview sequence C'];
   const ids = await createPreviewDocuments(page, [
