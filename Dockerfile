@@ -40,6 +40,22 @@ RUN echo 'server { \
     try_files $uri $uri/ /index.html; \
     } \
     \
+    # Markdown files mounted from the host (read-only) \
+    location ^~ /files/ { \
+    try_files $uri $uri/ =404; \
+    autoindex on; \
+    autoindex_format json; \
+    types { text/markdown md markdown; } \
+    charset utf-8; \
+    charset_types text/markdown; \
+    add_header Cache-Control "no-cache" always; \
+    add_header X-Frame-Options "SAMEORIGIN" always; \
+    add_header X-Content-Type-Options "nosniff" always; \
+    add_header X-XSS-Protection "1; mode=block" always; \
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always; \
+    add_header Content-Security-Policy "default-src '"'"'self'"'"'; base-uri '"'"'self'"'"'; object-src '"'"'none'"'"'; script-src '"'"'self'"'"' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net '"'"'unsafe-inline'"'"'; worker-src '"'"'self'"'"'; connect-src '"'"'self'"'"' https://api.github.com https://raw.githubusercontent.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://kroki.io https://www.plantuml.com https://mermaid.ink https://paulrosen.github.io; img-src '"'"'self'"'"' data: blob: https:; style-src '"'"'self'"'"' '"'"'unsafe-inline'"'"' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; font-src '"'"'self'"'"' data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; media-src '"'"'self'"'"' blob: data:; manifest-src '"'"'self'"'"'; upgrade-insecure-requests" always; \
+    } \
+    \
     # Cache static assets \
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ { \
     expires 1y; \

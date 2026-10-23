@@ -6,7 +6,9 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ${MARKDOWN_DIR:-./docs}:/usr/share/nginx/html/files:ro
     container_name: markdown-viewer
     restart: unless-stopped
     environment:

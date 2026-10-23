@@ -1,4 +1,4 @@
-const CACHE_NAME = 'markdown-viewer-cache-v3.10.4';
+const CACHE_NAME = 'markdown-viewer-cache-v3.10.5';
 
 // PERF-011: Split precache into critical (local files) and lazy (CDN libraries)
 // Critical assets are precached during SW install for instant offline startup
@@ -70,6 +70,11 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   const isLocal = url.origin === self.location.origin;
   const isCDN = CDN_ORIGINS.some(origin => url.hostname.includes(origin));
+
+  if (isLocal && url.pathname.startsWith('/files/')) {
+    // Mounted host files: always go to the network so ETag checks stay accurate.
+    return;
+  }
 
   if (isLocal) {
     const localPath = url.pathname.endsWith('/') ? '/' : url.pathname;
