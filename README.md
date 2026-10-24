@@ -35,7 +35,7 @@ The port is bound to `127.0.0.1` only, so other machines on your network cannot 
 ## Use the mounted folder
 
 - **Disk workspace** (sidebar): shows the `.md` and `.markdown` files of the mounted folder and its subfolders (dotfiles are skipped, maximum 2000 files). Added, removed, and renamed files show in about 5 seconds. Disk documents are read only. To edit one, use **Copy to Workspace** in its menu.
-- **Open from disk** (**+** menu): imports one file from the mounted folder as an editable document. The document follows the file: a change on disk updates it in about 2 seconds. If you have local edits, the app asks you to reload from disk or keep your version. Use **Stop watching file** in the tab menu to unlink it.
+- **Open local file (watch)** (**+** menu, Chromium only): opens any Markdown file on your computer as an editable document. It does not use the mounted folder. The document follows the file: a change on disk updates it in about 2 seconds and replaces your local edits (use Ctrl+Z to get them back). After a page reload, click **Reconnect** to let the browser read the file again. Use **Stop watching file** in the tab menu to unlink it.
 
 The container cannot write to the mounted folder. Your edits stay in the browser storage (IndexedDB) of the browser you use.
 

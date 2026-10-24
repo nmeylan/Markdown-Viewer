@@ -15766,6 +15766,102 @@ ${selector} .arrowheadPath {
     saveTabsToStorage(tabs, [tab.id]);
   }
 
+  function reportMissingLinkedFile(tab) {
+    if (linkedFileMissingIds.has(tab.id) || isDiskDocument(tab)) return;
+    linkedFileMissingIds.add(tab.id);
+    showAppToast('“' + (tab.title || 'Untitled') + '” is no longer at ' + tab.sourcePath + '. The document was kept.', {
+      tone: 'warning',
+      title: 'File missing on disk'
+    });
+  }
+
+  // Documents linked to a local file picked with the File System Access API (Chromium only).
+  // The handle cannot go into the tab metadata, so it is kept in its own IndexedDB store.
+  const linkedFileHandles = new Map();
+  const linkedFileHandleDeclinedIds = new Set();
+  let linkedFileHandleDatabase = null;
+
+  function linkedFileHandleRequest(mode, run) {
+    if (!linkedFileHandleDatabase) {
+      linkedFileHandleDatabase = new Promise(function(resolve, reject) {
+        const request = window.indexedDB.open('markdown-viewer-file-handles', 1);
+        request.onupgradeneeded = function() { request.result.createObjectStore('handles'); };
+        request.onsuccess = function() { resolve(request.result); };
+        request.onerror = function() { reject(request.error); };
+      });
+    }
+    return linkedFileHandleDatabase.then(function(database) {
+      return new Promise(function(resolve, reject) {
+        const request = run(database.transaction('handles', mode).objectStore('handles'));
+        request.onsuccess = function() { resolve(request.result); };
+        request.onerror = function() { reject(request.error); };
+      });
+    });
+  }
+
+  function getLinkedFileHandleEtag(file) {
+    return file.lastModified + ':' + file.size;
+  }
+
+  async function readLinkedFileHandle(tab) {
+    let handle = linkedFileHandles.get(tab.id);
+    if (!handle) {
+      handle = await linkedFileHandleRequest('readonly', function(store) { return store.get(tab.id); });
+      if (!handle) return null;
+      linkedFileHandles.set(tab.id, handle);
+    }
+    if (await handle.queryPermission({ mode: 'read' }) !== 'granted') {
+      requestLinkedFileHandlePermission(tab, handle);
+      return null;
+    }
+    const file = await handle.getFile();
+    const etag = getLinkedFileHandleEtag(file);
+    if (etag === tab.sourceEtag) return { etag: etag };
+    return { text: (await file.text()).replace(/\r\n?/g, '\n'), etag: etag };
+  }
+
+  // After a page reload the browser asks again for read access, and only a click can grant it.
+  async function requestLinkedFileHandlePermission(tab, handle) {
+    if (linkedFilePromptIds.has(tab.id) || linkedFileHandleDeclinedIds.has(tab.id)) return;
+    linkedFilePromptIds.add(tab.id);
+    const reconnect = await showAppToastConfirmation('Allow the browser to read “' + (tab.title || 'Untitled') + '” again to follow its changes.', {
+      title: 'Reconnect file',
+      confirmLabel: 'Reconnect',
+      cancelLabel: 'Not now',
+      dedupeKey: 'linked-handle:' + tab.id
+    });
+    linkedFilePromptIds.delete(tab.id);
+    if (reconnect && await handle.requestPermission({ mode: 'read' }) === 'granted') {
+      checkLinkedDocument(tab);
+    } else {
+      linkedFileHandleDeclinedIds.add(tab.id);
+    }
+  }
+
+  async function openLocalLinkedFile() {
+    let handle;
+    try {
+      [handle] = await window.showOpenFilePicker({
+        types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md', '.markdown'] } }]
+      });
+    } catch (_) {
+      return;
+    }
+    const file = await handle.getFile();
+    let location = getPreferredDocumentLocation();
+    if (location.workspaceId === SECRET_WORKSPACE_ID) location = { workspaceId: DEFAULT_WORKSPACE_ID, folderId: null };
+    const tab = createImportedDocument((await file.text()).replace(/\r\n?/g, '\n'), getMarkdownFileTitle({ name: file.name }), location);
+    if (!tab) return;
+    tab.sourceKind = 'handle';
+    tab.sourcePath = file.name;
+    tab.sourceEtag = getLinkedFileHandleEtag(file);
+    tab.sourceSyncedAt = Date.now();
+    linkedFileHandles.set(tab.id, handle);
+    await persistImportedDocuments([tab.id]);
+    await linkedFileHandleRequest('readwrite', function(store) { return store.put(handle, tab.id); });
+    await switchTab(tab.id);
+  }
+
   async function checkLinkedDocument(tab) {
     if (!tab || !tab.sourcePath || linkedFileCheckIds.has(tab.id) || linkedFilePromptIds.has(tab.id)) return;
     if (tab.workspaceId === SECRET_WORKSPACE_ID || (liveCollaboration && liveCollaboration.tabId === tab.id)) return;
@@ -15773,31 +15869,33 @@ ${selector} .arrowheadPath {
     let file;
     linkedFileCheckIds.add(tab.id);
     try {
-      const response = await fetch(getLinkedFileUrl(tab.sourcePath), {
-        cache: 'no-store',
-        headers: etag ? { 'If-None-Match': etag } : {}
-      });
-      if (response.status === 404) {
-        if (!linkedFileMissingIds.has(tab.id) && !isDiskDocument(tab)) {
-          linkedFileMissingIds.add(tab.id);
-          showAppToast('“' + (tab.title || 'Untitled') + '” is no longer at ' + tab.sourcePath + '. The document was kept.', {
-            tone: 'warning',
-            title: 'File missing on disk'
-          });
+      if (tab.sourceKind === 'handle') {
+        file = await readLinkedFileHandle(tab);
+        linkedFileMissingIds.delete(tab.id);
+        if (!file || file.etag === etag) return;
+      } else {
+        const response = await fetch(getLinkedFileUrl(tab.sourcePath), {
+          cache: 'no-store',
+          headers: etag ? { 'If-None-Match': etag } : {}
+        });
+        if (response.status === 404) {
+          reportMissingLinkedFile(tab);
+          return;
         }
-        return;
+        linkedFileMissingIds.delete(tab.id);
+        if (response.status !== 200) return;
+        file = await readLinkedFileResponse(response);
       }
-      linkedFileMissingIds.delete(tab.id);
-      if (response.status !== 200) return;
-      file = await readLinkedFileResponse(response);
-    } catch (_) {
+    } catch (error) {
+      if (error && error.name === 'NotFoundError') reportMissingLinkedFile(tab);
       return;
     } finally {
       linkedFileCheckIds.delete(tab.id);
     }
     if (!tabs.includes(tab) || tab.sourceEtag !== etag || !tab.sourcePath) return;
     if (tab.id === activeTabId) saveCurrentTabState();
-    if (!isLinkedTabDirty(tab)) {
+    // For local files picked in the browser, the file on disk always wins over browser edits.
+    if (tab.sourceKind === 'handle' || !isLinkedTabDirty(tab)) {
       applyLinkedFileContent(tab, file.text, file.etag);
       return;
     }
@@ -15821,6 +15919,11 @@ ${selector} .arrowheadPath {
   function stopWatchingLinkedFile(tabId) {
     const tab = tabs.find(function(item) { return item.id === tabId; });
     if (!tab) return;
+    if (tab.sourceKind === 'handle') {
+      linkedFileHandles.delete(tab.id);
+      linkedFileHandleRequest('readwrite', function(store) { return store.delete(tab.id); });
+    }
+    delete tab.sourceKind;
     delete tab.sourcePath;
     delete tab.sourceEtag;
     delete tab.sourceSyncedAt;
@@ -15829,135 +15932,13 @@ ${selector} .arrowheadPath {
     renderTabBar(tabs, activeTabId);
   }
 
-  async function openLinkedFile(path) {
-    const existing = tabs.find(function(tab) {
-      return tab.sourcePath === path && tab.workspaceId !== SECRET_WORKSPACE_ID && !isDiskDocument(tab);
-    });
-    if (existing) {
-      await switchTab(existing.id);
-      return;
-    }
-    let file;
-    try {
-      const response = await fetch(getLinkedFileUrl(path), { cache: 'no-store' });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      file = await readLinkedFileResponse(response);
-    } catch (_) {
-      showAppToast('The file could not be read from disk.', { tone: 'error', title: 'Open from disk failed' });
-      return;
-    }
-    let location = getPreferredDocumentLocation();
-    if (location.workspaceId === SECRET_WORKSPACE_ID) location = { workspaceId: DEFAULT_WORKSPACE_ID, folderId: null };
-    const tab = createImportedDocument(file.text, getMarkdownFileTitle({ name: path.split('/').pop() }), location);
-    if (!tab) return;
-    tab.sourcePath = path;
-    tab.sourceEtag = file.etag;
-    tab.sourceSyncedAt = Date.now();
-    await persistImportedDocuments([tab.id]);
-    await switchTab(tab.id);
-  }
-
-  function openDiskFileDialog() {
-    const modal = document.getElementById('disk-file-modal');
-    const pathLabel = document.getElementById('disk-file-modal-path');
-    const list = document.getElementById('disk-file-list');
-    const error = document.getElementById('disk-file-modal-error');
-    const confirmButton = document.getElementById('disk-file-modal-confirm');
-    const cancelButton = document.getElementById('disk-file-modal-cancel');
-    const closeButton = document.getElementById('disk-file-modal-close');
-    if (!modal || !list || !confirmButton || !cancelButton) return;
-    let currentDir = '';
-
-    async function showDirectory(dir) {
-      error.hidden = true;
-      let entries;
-      try {
-        const response = await fetch(getLinkedFileUrl(dir), { cache: 'no-store' });
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        entries = await response.json();
-      } catch (_) {
-        error.textContent = 'This folder could not be listed.';
-        error.hidden = false;
-        return;
-      }
-      currentDir = dir;
-      pathLabel.textContent = '/' + dir;
-      list.textContent = '';
-      if (dir) {
-        const option = document.createElement('option');
-        option.value = 'up';
-        option.textContent = '..';
-        list.appendChild(option);
-      }
-      entries.filter(function(entry) {
-        return entry.name.charAt(0) !== '.' &&
-          (entry.type === 'directory' || (entry.type === 'file' && /\.(md|markdown)$/i.test(entry.name)));
-      }).sort(function(a, b) {
-        if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      }).forEach(function(entry) {
-        const isDirectory = entry.type === 'directory';
-        const option = document.createElement('option');
-        option.value = (isDirectory ? 'dir:' : 'file:') + dir + entry.name + (isDirectory ? '/' : '');
-        option.textContent = entry.name + (isDirectory ? '/' : '');
-        list.appendChild(option);
-      });
-    }
-
-    function cleanup() {
-      confirmButton.removeEventListener('click', confirm);
-      cancelButton.removeEventListener('click', cancel);
-      list.removeEventListener('dblclick', confirm);
-      list.removeEventListener('keydown', handleKeydown);
-      if (closeButton) closeButton.removeEventListener('click', cancel);
-    }
-
-    function cancel() {
-      cleanup();
-      closeAppModal(modal);
-    }
-
-    function confirm() {
-      const value = list.value;
-      if (value === 'up') {
-        showDirectory(currentDir.replace(/[^/]*\/$/, ''));
-      } else if (value.indexOf('dir:') === 0) {
-        showDirectory(value.slice(4));
-      } else if (value.indexOf('file:') === 0) {
-        cleanup();
-        closeAppModal(modal);
-        openLinkedFile(value.slice(5));
-      }
-    }
-
-    function handleKeydown(event) {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        confirm();
-      }
-    }
-
-    confirmButton.addEventListener('click', confirm);
-    cancelButton.addEventListener('click', cancel);
-    list.addEventListener('dblclick', confirm);
-    list.addEventListener('keydown', handleKeydown);
-    if (closeButton) closeButton.addEventListener('click', cancel);
-    showDirectory('');
-    openAppModal(modal, { focusTarget: list, onClose: cancel });
-  }
-
-  const importFromDiskButton = document.getElementById('import-from-disk');
-  if (importFromDiskButton) {
-    importFromDiskButton.addEventListener('click', function(event) {
+  const importFromLocalFileButton = document.getElementById('import-from-local-file');
+  if (importFromLocalFileButton && 'showOpenFilePicker' in window) {
+    importFromLocalFileButton.addEventListener('click', function(event) {
       event.preventDefault();
-      openDiskFileDialog();
+      openLocalLinkedFile();
     });
-    fetch('/files/', { cache: 'no-store' }).then(function(response) {
-      const type = response.headers.get('Content-Type') || '';
-      if (response.ok && type.indexOf('json') !== -1) {
-        document.getElementById('import-from-disk-item').hidden = false;
-      }
-    }).catch(function() {});
+    document.getElementById('import-from-local-file-item').hidden = false;
   }
 
   setInterval(function() {
